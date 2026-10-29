@@ -1,0 +1,136 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------- helpers ----------
+    function signedIn() { return request.auth != null; }
+    function ownsExisting() { return signedIn() && resource.data.ownerId == request.auth.uid; }
+    function createsOwn(docId) {
+      return signedIn()
+        && request.resource.data.ownerId == request.auth.uid
+        && request.resource.data.id == docId;
+    }
+    function ownerAndIdUnchanged() {
+      return request.resource.data.ownerId == resource.data.ownerId
+        && request.resource.data.id == resource.data.id;
+    }
+    function str(v, max) { return v is string && v.size() <= max; }
+    function optStr(v, max) { return v == null || str(v, max); }
+
+    // ---------- contacts ----------
+    function validContact() {
+      let d = request.resource.data;
+      return str(d.firstName, 100) && str(d.lastName, 100) && str(d.fullName, 250)
+        && str(d.jobTitle, 500) && str(d.company, 500) && str(d.location, 500)
+        && str(d.linkedInProfileUrl, 500) && str(d.email, 254) && str(d.notes, 5000)
+        && d.classificationStatus in ['potential', 'confirmed', 'not_relevant', 'needs_review']
+        && d.reviewStatus in ['unreviewed', 'reviewed']
+        && d.outreachStatus in ['not_contacted', 'draft_prepared', 'sent', 'replied', 'skipped']
+        && d.matchedKeywords is list && d.matchedKeywords.size() <= 50
+        && d.source is map && d.source.type in ['linkedin_csv', 'manual', 'demo']
+        && d.isDemo is bool
+        && optStr(d.lastContactedAt, 40) && optStr(d.lastRepliedAt, 40);
+    }
+    match /contacts/{id} {
+      allow read: if ownsExisting();
+      allow create: if createsOwn(id) && validContact();
+      allow update: if ownsExisting() && ownerAndIdUnchanged() && validContact();
+      allow delete: if ownsExisting();
+    }
+
+    // ---------- message templates ----------
+    function validTemplate() {
+      let d = request.resource.data;
+      return str(d.name, 120) && d.name.size() > 0 && str(d.body, 5000) && d.body.size() > 0 && d.isDefault is bool;
+    }
+    match /messageTemplates/{id} {
+      allow read: if ownsExisting();
+      allow create: if createsOwn(id) && validTemplate();
+      allow update: if ownsExisting() && ownerAndIdUnchanged() && validTemplate();
+      allow delete: if ownsExisting();
+    }
+
+    // ---------- campaigns ----------
+    match /outreachCampaigns/{id} {
+      allow read: if ownsExisting();
+      allow create: if createsOwn(id) && str(request.resource.data.name, 200) && request.resource.data.contactCount is int;
+      allow update: if ownsExisting() && ownerAndIdUnchanged();
+      allow delete: if ownsExisting();
+    }
+
+    // ---------- outreach messages ----------
+    // A message can only become "sent"/"replied" together with an explicit confirmation record,
+    // and a sent message's text and sentAt can no longer be altered.
+    function validMessage() {
+      let d = request.resource.data;
+      return str(d.contactId, 100) && str(d.renderedMessage, 10000)
+        && d.status in ['draft', 'skipped', 'sent', 'replied']
+        && d.sendingMethod in ['linkedin_manual', 'email_manual']
+        && optStr(d.sentAt, 40) && optStr(d.responseRecordedAt, 40) && optStr(d.errorMessage, 1000)
+        && (!(d.status in ['sent', 'replied'])
+            || (d.confirmationMethod in ['manual_user_confirmation', 'provider_reliable'] && d.sentAt is string));
+    }
+    function sentMessageFrozen() {
+      return !(resource.data.status in ['sent', 'replied'])
+        || (request.resource.data.renderedMessage == resource.data.renderedMessage
+            && request.resource.data.sentAt == resource.data.sentAt
+            && request.resource.data.contactId == resource.data.contactId);
+    }
+    match /outreachMessages/{id} {
+      allow read: if ownsExisting();
+      allow create: if createsOwn(id) && validMessage();
+      allow update: if ownsExisting() && ownerAndIdUnchanged() && validMessage() && sentMessageFrozen();
+      allow delete: if ownsExisting() && !(resource.data.status in ['sent', 'replied']);
+    }
+
+    // ---------- CV (stored as base64 chunks in Firestore, owner-only; no Storage, no server, no public URL) ----------
+    match /cvDocuments/{id} {
+      allow read: if ownsExisting();
+      allow create: if createsOwn(id)
+        && str(request.resource.data.fileName, 200) && request.resource.data.fileName.size() > 0
+        && request.resource.data.sizeBytes is int && request.resource.data.sizeBytes > 0 && request.resource.data.sizeBytes <= 3145728
+        && request.resource.data.chunkCount is int && request.resource.data.chunkCount >= 1 && request.resource.data.chunkCount <= 10;
+      allow update: if false;
+      allow delete: if ownsExisting();
+    }
+    match /cvChunks/{id} {
+      allow read: if ownsExisting();
+      allow create: if createsOwn(id)
+        && request.resource.data.cvId is string
+        && request.resource.data.index is int && request.resource.data.index >= 0 && request.resource.data.index < 10
+        && str(request.resource.data.data, 500000);
+      allow update: if false;
+      allow delete: if ownsExisting();
+    }
+
+    // ---------- audit trail: append-only ----------
+    match /activityLogs/{id} {
+      allow read: if ownsExisting();
+      allow create: if createsOwn(id) && str(request.resource.data.action, 100) && str(request.resource.data.details, 500);
+      allow update, delete: if false;
+    }
+
+    // ---------- per-user settings (document id == uid) ----------
+    // NOTE: reads are checked against the stored ownerId (not the path wildcard) because the app
+    // loads settings with a `where ownerId == uid` query, and Firestore rejects list queries whose
+    // rule depends only on the document-id wildcard.
+    match /userSettings/{uid} {
+      allow read: if ownsExisting();
+      allow create, update: if signedIn() && request.auth.uid == uid
+        && request.resource.data.ownerId == uid
+        && request.resource.data.keywords is list && request.resource.data.keywords.size() <= 200
+        && str(request.resource.data.senderName, 100)
+        && (!('linkedInProfileUrl' in request.resource.data) || str(request.resource.data.linkedInProfileUrl, 300))
+        && (!('portfolioUrl' in request.resource.data) || str(request.resource.data.portfolioUrl, 300));
+      allow delete: if false;
+    }
+
+    // ---------- users (profile, reserved for future multi-user features) ----------
+    match /users/{uid} {
+      allow read, write: if signedIn() && request.auth.uid == uid;
+    }
+
+    match /{document=**} { allow read, write: if false; }
+  }
+}
